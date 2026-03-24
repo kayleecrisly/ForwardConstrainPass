@@ -1,0 +1,252 @@
+{
+  "modules": [
+    {
+      "module": "tlul_rsp_intg_gen_14",
+      "combinational_logic": [
+        {
+          "target": "rsp_intg",
+          "expression": "0",
+          "bitWidth": 7,
+          "c_code": "s->rsp_intg = 0;"
+        },
+        {
+          "target": "data_intg",
+          "expression": "0",
+          "bitWidth": 7,
+          "c_code": "s->data_intg = 0;"
+        }
+      ]
+    },
+    {
+      "module": "uart_core",
+      "combinational_logic": [
+        {
+          "target": "unnamed",
+          "expression": "s->rx_val_q",
+          "bitWidth": 16,
+          "c_code": "s->unnamed = s->rx_val_q;"
+        },
+        {
+          "target": "tick_baud_x16",
+          "expression": "(((s->nco_sum_q) >> 16) & 0x1)",
+          "bitWidth": 1,
+          "c_code": "s->tick_baud_x16 = (((s->nco_sum_q) >> 16) & 0x1);"
+        },
+        {
+          "target": "rx_in_maj",
+          "expression": "((s->rx_sync) & (s->rx_sync_q1)) | ((s->rx_sync) & (s->rx_sync_q2)) | ((s->rx_sync_q1) & (s->rx_sync_q2))",
+          "bitWidth": 1,
+          "c_code": "s->rx_in_maj = ((s->rx_sync) & (s->rx_sync_q1)) | ((s->rx_sync) & (s->rx_sync_q2)) | ((s->rx_sync_q1) & (s->rx_sync_q2));"
+        },
+        {
+          "target": "rx_in",
+          "expression": "((s->sys_loopback) ? (s->tx_out) : ((s->line_loopback) | (s->rx_in_mx)))",
+          "bitWidth": 1,
+          "c_code": "s->rx_in = ((s->sys_loopback) ? (s->tx_out) : ((s->line_loopback) | (s->rx_in_mx)));"
+        },
+        {
+          "target": "rx_fifo_depth_changed",
+          "expression": "((s->rx_fifo_depth) != (s->rx_fifo_depth_prev_q))",
+          "bitWidth": 1,
+          "c_code": "s->rx_fifo_depth_changed = ((s->rx_fifo_depth) != (s->rx_fifo_depth_prev_q));"
+        },
+        {
+          "target": "event_rx_break_err",
+          "expression": "(s->break_err) & (~(s->break_st_q))",
+          "bitWidth": 1,
+          "c_code": "s->event_rx_break_err = (s->break_err) & (~(s->break_st_q));"
+        }
+      ]
+    },
+    {
+      "module": "uart_reg_top",
+      "combinational_logic": [
+        {
+          "target": "racl_role_vec",
+          "expression": "0",
+          "bitWidth": 2,
+          "c_code": "s->racl_role_vec = 0;"
+        }
+      ]
+    },
+    {
+      "module": "prim_alert_sender",
+      "combinational_logic": [
+        {
+          "target": "alert_test_trigger",
+          "expression": "(arg2) | (s->alert_test_set_q)",
+          "bitWidth": 1,
+          "c_code": "s->alert_test_trigger = (arg2) | (s->alert_test_set_q);"
+        },
+        {
+          "target": "alert_test_set_d",
+          "expression": "(~(s->alert_clr)) & (s->alert_test_trigger)",
+          "bitWidth": 1,
+          "c_code": "s->alert_test_set_d = (~(s->alert_clr)) & (s->alert_test_trigger);"
+        },
+        {
+          "target": "ping_set_d",
+          "expression": "(~(s->ping_clr)) & (s->ping_trigger)",
+          "bitWidth": 1,
+          "c_code": "s->ping_set_d = (~(s->ping_clr)) & (s->ping_trigger);"
+        }
+      ]
+    },
+    {
+      "module": "prim_diff_decode",
+      "combinational_logic": [
+        {
+          "target": "gen_async_diff_p_edge",
+          "expression": "(s->gen_async_diff_pq) ^ (s->gen_async_diff_pd)",
+          "bitWidth": 1,
+          "c_code": "s->gen_async_diff_p_edge = (s->gen_async_diff_pq) ^ (s->gen_async_diff_pd);"
+        },
+        {
+          "target": "gen_async_diff_n_edge",
+          "expression": "(s->gen_async_diff_nq) ^ (s->gen_async_diff_nd)",
+          "bitWidth": 1,
+          "c_code": "s->gen_async_diff_n_edge = (s->gen_async_diff_nq) ^ (s->gen_async_diff_nd);"
+        },
+        {
+          "target": "gen_async_diff_check_ok",
+          "expression": "(s->gen_async_diff_pd) ^ (s->gen_async_diff_nd)",
+          "bitWidth": 1,
+          "c_code": "s->gen_async_diff_check_ok = (s->gen_async_diff_pd) ^ (s->gen_async_diff_nd);"
+        },
+        {
+          "target": "gen_async_level",
+          "expression": "s->gen_async_diff_pd",
+          "bitWidth": 1,
+          "c_code": "s->gen_async_level = s->gen_async_diff_pd;"
+        }
+      ]
+    },
+    {
+      "module": "prim_fifo_sync_cnt",
+      "combinational_logic": [
+        {
+          "target": "wptr_wrap_msb",
+          "expression": "(((s->wptr_wrap_cnt_q) >> 5) & 0x1)",
+          "bitWidth": 1,
+          "c_code": "s->wptr_wrap_msb = (((s->wptr_wrap_cnt_q) >> 5) & 0x1);"
+        },
+        {
+          "target": "rptr_wrap_msb",
+          "expression": "(((s->rptr_wrap_cnt_q) >> 5) & 0x1)",
+          "bitWidth": 1,
+          "c_code": "s->rptr_wrap_msb = (((s->rptr_wrap_cnt_q) >> 5) & 0x1);"
+        },
+        {
+          "target": "wptr_wrap_set",
+          "expression": "(s->incr_wptr_i) & (((s->wptr_o) == (31)))",
+          "bitWidth": 1,
+          "c_code": "s->wptr_wrap_set = (s->incr_wptr_i) & (((s->wptr_o) == (31)));"
+        },
+        {
+          "target": "rptr_wrap_set",
+          "expression": "(s->incr_rptr_i) & (((s->rptr_o) == (31)))",
+          "bitWidth": 1,
+          "c_code": "s->rptr_wrap_set = (s->incr_rptr_i) & (((s->rptr_o) == (31)));"
+        },
+        {
+          "target": "wptr_wrap_set_cnt",
+          "expression": "(((~(s->wptr_wrap_msb)) << 5) | (0))",
+          "bitWidth": 6,
+          "c_code": "s->wptr_wrap_set_cnt = (((~(s->wptr_wrap_msb)) << 5) | (0));"
+        },
+        {
+          "target": "rptr_wrap_set_cnt",
+          "expression": "(((~(s->rptr_wrap_msb)) << 5) | (0))",
+          "bitWidth": 6,
+          "c_code": "s->rptr_wrap_set_cnt = (((~(s->rptr_wrap_msb)) << 5) | (0));"
+        }
+      ]
+    },
+    {
+      "module": "prim_fifo_sync_cnt_24",
+      "combinational_logic": [
+        {
+          "target": "wptr_wrap_msb",
+          "expression": "(((s->wptr_wrap_cnt_q) >> 6) & 0x1)",
+          "bitWidth": 1,
+          "c_code": "s->wptr_wrap_msb = (((s->wptr_wrap_cnt_q) >> 6) & 0x1);"
+        },
+        {
+          "target": "rptr_wrap_msb",
+          "expression": "(((s->rptr_wrap_cnt_q) >> 6) & 0x1)",
+          "bitWidth": 1,
+          "c_code": "s->rptr_wrap_msb = (((s->rptr_wrap_cnt_q) >> 6) & 0x1);"
+        },
+        {
+          "target": "wptr_wrap_set",
+          "expression": "(s->incr_wptr_i) & (((s->wptr_o) == (63)))",
+          "bitWidth": 1,
+          "c_code": "s->wptr_wrap_set = (s->incr_wptr_i) & (((s->wptr_o) == (63)));"
+        },
+        {
+          "target": "rptr_wrap_set",
+          "expression": "(s->incr_rptr_i) & (((s->rptr_o) == (63)))",
+          "bitWidth": 1,
+          "c_code": "s->rptr_wrap_set = (s->incr_rptr_i) & (((s->rptr_o) == (63)));"
+        },
+        {
+          "target": "wptr_wrap_set_cnt",
+          "expression": "(((~(s->wptr_wrap_msb)) << 6) | (0))",
+          "bitWidth": 7,
+          "c_code": "s->wptr_wrap_set_cnt = (((~(s->wptr_wrap_msb)) << 6) | (0));"
+        },
+        {
+          "target": "rptr_wrap_set_cnt",
+          "expression": "(((~(s->rptr_wrap_msb)) << 6) | (0))",
+          "bitWidth": 7,
+          "c_code": "s->rptr_wrap_set_cnt = (((~(s->rptr_wrap_msb)) << 6) | (0));"
+        }
+      ]
+    },
+    {
+      "module": "prim_intr_hw",
+      "combinational_logic": [
+        {
+          "target": "status",
+          "expression": "(arg2) | (s->g_intr_status_test_q)",
+          "bitWidth": 1,
+          "c_code": "s->status = (arg2) | (s->g_intr_status_test_q);"
+        }
+      ]
+    },
+    {
+      "module": "prim_intr_hw_12",
+      "combinational_logic": [
+        {
+          "target": "status",
+          "expression": "arg6",
+          "bitWidth": 1,
+          "c_code": "s->status = arg6;"
+        }
+      ]
+    },
+    {
+      "module": "prim_onehot_check",
+      "combinational_logic": [
+        {
+          "target": "or_tree",
+          "expression": "((((s->or_tree) >> 1) & 0x1)) | ((((s->or_tree) >> 2) & 0x1))",
+          "bitWidth": 1,
+          "c_code": "s->or_tree = ((((s->or_tree) >> 1) & 0x1)) | ((((s->or_tree) >> 2) & 0x1));"
+        },
+        {
+          "target": "and_tree",
+          "expression": "((~((((arg3) >> 3) & 0x1))) & ((((s->and_tree) >> 1) & 0x1))) | (((((arg3) >> 3) & 0x1)) & ((((s->and_tree) >> 2) & 0x1)))",
+          "bitWidth": 1,
+          "c_code": "s->and_tree = ((~((((arg3) >> 3) & 0x1))) & ((((s->and_tree) >> 1) & 0x1))) | (((((arg3) >> 3) & 0x1)) & ((((s->and_tree) >> 2) & 0x1)));"
+        },
+        {
+          "target": "err_tree",
+          "expression": "(((((s->or_tree) >> 1) & 0x1)) & ((((s->or_tree) >> 2) & 0x1))) | ((((s->err_tree) >> 1) & 0x1)) | ((((s->err_tree) >> 2) & 0x1))",
+          "bitWidth": 1,
+          "c_code": "s->err_tree = (((((s->or_tree) >> 1) & 0x1)) & ((((s->or_tree) >> 2) & 0x1))) | ((((s->err_tree) >> 1) & 0x1)) | ((((s->err_tree) >> 2) & 0x1));"
+        }
+      ]
+    }
+  ]
+}

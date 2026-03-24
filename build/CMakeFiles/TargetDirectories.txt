@@ -1,0 +1,17 @@
+/home/kaylee/circt-workspace/circt/workspace/QEMU-OUT-frame/build/CMakeFiles/intrinsics_gen.dir
+/home/kaylee/circt-workspace/circt/workspace/QEMU-OUT-frame/build/CMakeFiles/vt_gen.dir
+/home/kaylee/circt-workspace/circt/workspace/QEMU-OUT-frame/build/CMakeFiles/omp_gen.dir
+/home/kaylee/circt-workspace/circt/workspace/QEMU-OUT-frame/build/CMakeFiles/acc_gen.dir
+/home/kaylee/circt-workspace/circt/workspace/QEMU-OUT-frame/build/CMakeFiles/target_parser_gen.dir
+/home/kaylee/circt-workspace/circt/workspace/QEMU-OUT-frame/build/CMakeFiles/mlir-tablegen-targets.dir
+/home/kaylee/circt-workspace/circt/workspace/QEMU-OUT-frame/build/CMakeFiles/mlir-headers.dir
+/home/kaylee/circt-workspace/circt/workspace/QEMU-OUT-frame/build/CMakeFiles/mlir-generic-headers.dir
+/home/kaylee/circt-workspace/circt/workspace/QEMU-OUT-frame/build/CMakeFiles/mlir-doc.dir
+/home/kaylee/circt-workspace/circt/workspace/QEMU-OUT-frame/build/CMakeFiles/circt-tablegen-targets.dir
+/home/kaylee/circt-workspace/circt/workspace/QEMU-OUT-frame/build/CMakeFiles/circt-headers.dir
+/home/kaylee/circt-workspace/circt/workspace/QEMU-OUT-frame/build/CMakeFiles/circt-generic-headers.dir
+/home/kaylee/circt-workspace/circt/workspace/QEMU-OUT-frame/build/CMakeFiles/circt-doc.dir
+/home/kaylee/circt-workspace/circt/workspace/QEMU-OUT-frame/build/CMakeFiles/QemuPassesIncGen.dir
+/home/kaylee/circt-workspace/circt/workspace/QEMU-OUT-frame/build/CMakeFiles/qemu-passes.dir
+/home/kaylee/circt-workspace/circt/workspace/QEMU-OUT-frame/build/CMakeFiles/edit_cache.dir
+/home/kaylee/circt-workspace/circt/workspace/QEMU-OUT-frame/build/CMakeFiles/rebuild_cache.dir
