@@ -176,8 +176,6 @@ def ForwardConstrain : Pass<"forward-constrain", "mlir::ModuleOp"> {
   let options = [
     Option<"targetSignal", "target-signal", "std::string", /*default=*/"\"pwrite\"",
            "The originating control signal to trace forward">,
-    Option<"targetActiveValue", "target-active-value", "uint64_t", /*default=*/"1",
-           "The expected active polarity of the originating signal (e.g., 1 for active-high)">,
     Option<"applyConstraints", "fc-apply-constraints", "bool", /*default=*/"false",
            "If true, mutate the IR by injecting hw.constant to replace identified bus signals">,
     Option<"busSignals", "fc-bus-signals", "std::string", /*default=*/"\"\"",

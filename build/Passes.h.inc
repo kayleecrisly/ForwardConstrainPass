@@ -426,7 +426,6 @@ std::unique_ptr<::mlir::Pass> createDrvClassification() {
 #ifdef GEN_PASS_DECL_FORWARDCONSTRAIN
 struct ForwardConstrainOptions {
   std::string targetSignal = "pwrite";
-  uint64_t targetActiveValue = 1;
   bool applyConstraints = false;
   std::string busSignals = "";
 };
@@ -493,13 +492,11 @@ public:
 
   ForwardConstrainBase(ForwardConstrainOptions options) : ForwardConstrainBase() {
     targetSignal = std::move(options.targetSignal);
-    targetActiveValue = std::move(options.targetActiveValue);
     applyConstraints = std::move(options.applyConstraints);
     busSignals = std::move(options.busSignals);
   }
 protected:
   ::mlir::Pass::Option<std::string> targetSignal{*this, "target-signal", ::llvm::cl::desc("The originating control signal to trace forward"), ::llvm::cl::init("pwrite")};
-  ::mlir::Pass::Option<uint64_t> targetActiveValue{*this, "target-active-value", ::llvm::cl::desc("The expected active polarity of the originating signal (e.g., 1 for active-high)"), ::llvm::cl::init(1)};
   ::mlir::Pass::Option<bool> applyConstraints{*this, "fc-apply-constraints", ::llvm::cl::desc("If true, mutate the IR by injecting hw.constant to replace identified bus signals"), ::llvm::cl::init(false)};
   ::mlir::Pass::Option<std::string> busSignals{*this, "fc-bus-signals", ::llvm::cl::desc("Comma-separated list of signal names that are explicitly allowed to be replaced by constants"), ::llvm::cl::init("")};
 private:
@@ -1177,7 +1174,6 @@ public:
 
 protected:
   ::mlir::Pass::Option<std::string> targetSignal{*this, "target-signal", ::llvm::cl::desc("The originating control signal to trace forward"), ::llvm::cl::init("pwrite")};
-  ::mlir::Pass::Option<uint64_t> targetActiveValue{*this, "target-active-value", ::llvm::cl::desc("The expected active polarity of the originating signal (e.g., 1 for active-high)"), ::llvm::cl::init(1)};
   ::mlir::Pass::Option<bool> applyConstraints{*this, "fc-apply-constraints", ::llvm::cl::desc("If true, mutate the IR by injecting hw.constant to replace identified bus signals"), ::llvm::cl::init(false)};
   ::mlir::Pass::Option<std::string> busSignals{*this, "fc-bus-signals", ::llvm::cl::desc("Comma-separated list of signal names that are explicitly allowed to be replaced by constants"), ::llvm::cl::init("")};
 };

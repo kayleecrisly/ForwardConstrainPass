@@ -140,11 +140,6 @@ static llvm::cl::opt<std::string> fcTargetSignal(
     llvm::cl::value_desc("signal"),
     llvm::cl::init("pwrite"));
 
-static llvm::cl::opt<unsigned long long> fcTargetActiveValue(
-    "fc-target-active-val",
-    llvm::cl::desc("Target active value for forward constrain pass (default: 1)"),
-    llvm::cl::value_desc("value"),
-    llvm::cl::init(1));
 
 static llvm::cl::opt<bool> runCombLogicExtract(
     "comb-logic-extract",
@@ -262,7 +257,6 @@ int main(int argc, char **argv) {
     if (runForwardConstrain) {
       ForwardConstrainOptions opts;
       opts.targetSignal = fcTargetSignal;
-      opts.targetActiveValue = fcTargetActiveValue;
       pm.addPass(createForwardConstrain(opts));
     }
     if (runCombLogicExtract) {
