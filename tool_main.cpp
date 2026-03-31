@@ -18,6 +18,13 @@
 //   qemu-passes input.mlir --qemu-emit-c
 //   qemu-passes input.mlir --all-passes -o output.mlir
 //
+//   # Forward constrain: analyze only
+//   qemu-passes input.mlir --forward-constrain --fc-target-signal=pwrite
+//
+//   # Forward constrain: analyze + replace + simplify
+//   qemu-passes input.mlir --forward-constrain --fc-target-signal=pwrite \
+//       --fc-apply-constraints --fc-bus-signals="psel,pready"
+//
 //===----------------------------------------------------------------------===//
 
 #include "mlir/IR/MLIRContext.h"
@@ -140,6 +147,16 @@ static llvm::cl::opt<std::string> fcTargetSignal(
     llvm::cl::value_desc("signal"),
     llvm::cl::init("pwrite"));
 
+static llvm::cl::opt<bool> fcApplyConstraints(
+    "fc-apply-constraints",
+    llvm::cl::desc("Replace identified bus signals with constants (Phase 3)"),
+    llvm::cl::init(false));
+
+static llvm::cl::opt<std::string> fcBusSignals(
+    "fc-bus-signals",
+    llvm::cl::desc("Comma-separated list of bus signal names to replace with constants"),
+    llvm::cl::value_desc("signals"),
+    llvm::cl::init(""));
 
 static llvm::cl::opt<bool> runCombLogicExtract(
     "comb-logic-extract",
@@ -183,6 +200,9 @@ int main(int argc, char **argv) {
       "  qemu-passes <input.mlir> --dff-demo\n"
       "  qemu-passes <input.mlir> --comb-logic-extract\n"
       "  qemu-passes <input.mlir> --all-passes -o output.mlir\n"
+      "  qemu-passes <input.mlir> --forward-constrain --fc-target-signal=pwrite\n"
+      "  qemu-passes <input.mlir> --forward-constrain --fc-target-signal=pwrite \\\n"
+      "      --fc-apply-constraints --fc-bus-signals=\"psel,pready\"\n"
   );
 
   // Create MLIR context and register dialects
@@ -257,6 +277,8 @@ int main(int argc, char **argv) {
     if (runForwardConstrain) {
       ForwardConstrainOptions opts;
       opts.targetSignal = fcTargetSignal;
+      opts.applyConstraints = fcApplyConstraints;
+      opts.busSignals = fcBusSignals;
       pm.addPass(createForwardConstrain(opts));
     }
     if (runCombLogicExtract) {

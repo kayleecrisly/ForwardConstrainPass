@@ -462,7 +462,7 @@ public:
   }
   ::llvm::StringRef getArgument() const override { return "forward-constrain"; }
 
-  ::llvm::StringRef getDescription() const override { return "Extract path sensitization constraints via forward tracing"; }
+  ::llvm::StringRef getDescription() const override { return "Extract path sensitization constraints and simplify bus signals"; }
 
   /// Returns the derived pass name.
   static constexpr ::llvm::StringLiteral getPassName() {
@@ -497,8 +497,8 @@ public:
   }
 protected:
   ::mlir::Pass::Option<std::string> targetSignal{*this, "target-signal", ::llvm::cl::desc("The originating control signal to trace forward"), ::llvm::cl::init("pwrite")};
-  ::mlir::Pass::Option<bool> applyConstraints{*this, "fc-apply-constraints", ::llvm::cl::desc("If true, mutate the IR by injecting hw.constant to replace identified bus signals"), ::llvm::cl::init(false)};
-  ::mlir::Pass::Option<std::string> busSignals{*this, "fc-bus-signals", ::llvm::cl::desc("Comma-separated list of signal names that are explicitly allowed to be replaced by constants"), ::llvm::cl::init("")};
+  ::mlir::Pass::Option<bool> applyConstraints{*this, "fc-apply-constraints", ::llvm::cl::desc("If true, mutate the IR by replacing identified bus signals with constants"), ::llvm::cl::init(false)};
+  ::mlir::Pass::Option<std::string> busSignals{*this, "fc-bus-signals", ::llvm::cl::desc("Comma-separated list of irrelevant bus signal names to replace with constants derived from Phase 1 analysis"), ::llvm::cl::init("")};
 private:
 
   friend std::unique_ptr<::mlir::Pass> createForwardConstrain() {
@@ -1144,7 +1144,7 @@ public:
   }
   ::llvm::StringRef getArgument() const override { return "forward-constrain"; }
 
-  ::llvm::StringRef getDescription() const override { return "Extract path sensitization constraints via forward tracing"; }
+  ::llvm::StringRef getDescription() const override { return "Extract path sensitization constraints and simplify bus signals"; }
 
   /// Returns the derived pass name.
   static constexpr ::llvm::StringLiteral getPassName() {
@@ -1174,8 +1174,8 @@ public:
 
 protected:
   ::mlir::Pass::Option<std::string> targetSignal{*this, "target-signal", ::llvm::cl::desc("The originating control signal to trace forward"), ::llvm::cl::init("pwrite")};
-  ::mlir::Pass::Option<bool> applyConstraints{*this, "fc-apply-constraints", ::llvm::cl::desc("If true, mutate the IR by injecting hw.constant to replace identified bus signals"), ::llvm::cl::init(false)};
-  ::mlir::Pass::Option<std::string> busSignals{*this, "fc-bus-signals", ::llvm::cl::desc("Comma-separated list of signal names that are explicitly allowed to be replaced by constants"), ::llvm::cl::init("")};
+  ::mlir::Pass::Option<bool> applyConstraints{*this, "fc-apply-constraints", ::llvm::cl::desc("If true, mutate the IR by replacing identified bus signals with constants"), ::llvm::cl::init(false)};
+  ::mlir::Pass::Option<std::string> busSignals{*this, "fc-bus-signals", ::llvm::cl::desc("Comma-separated list of irrelevant bus signal names to replace with constants derived from Phase 1 analysis"), ::llvm::cl::init("")};
 };
 
 template <typename DerivedT>

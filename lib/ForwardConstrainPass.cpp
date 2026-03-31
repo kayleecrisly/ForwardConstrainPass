@@ -8,9 +8,12 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/Support/LLVM.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/FormatVariadic.h"
 
@@ -65,6 +68,49 @@ struct TraceContext {
       isMultiBit(other.isMultiBit) {}
 };
 
+/// Represents one complete traced path from root signal to a register/wire
+/// drive endpoint.  Collected during Phase 1 (analysis) and consumed by
+/// Phase 3 (constant replacement).
+///
+/// The key insight: `constraints` already tells us, for every side-input on
+/// this path, what constant value it must hold for the path to be sensitized.
+/// When the user later marks a signal name as "irrelevant bus signal", we look
+/// up that name in the resolved constraints across all PathRecords and know
+/// exactly what constant to substitute — per path, automatically.
+struct PathRecord {
+  /// Human-readable name of the target register/wire that this path drives.
+  std::string targetRegister;
+
+  /// The terminator operation (llhd.drv / cf.cond_br) at the path endpoint.
+  Operation *endpoint = nullptr;
+
+  /// Raw constraint map: SSA Value -> required constant value.
+  /// This is the *original* Value-level map from TraceContext, preserved so
+  /// that Phase 3 can locate the exact SSA Value to replace.
+  DenseMap<Value, int> constraints;
+
+  /// Same constraints resolved to human-readable form: signal name -> value.
+  /// Built once at collection time so Phase 3 can match user-provided signal
+  /// names without re-running backward resolution.
+  SmallVector<std::pair<std::string, int>, 8> resolvedConstraints;
+
+  /// The operations along this path (for scope/location context).
+  SmallVector<Operation *, 8> path;
+
+  /// Expected polarity of the traced signal at the endpoint.
+  int expectedPolarity = 1;
+
+  /// Whether the driven value is NOT data-dependent on the traced signal
+  /// (i.e. control-flow-only influence).
+  bool isControlFlowOnly = false;
+
+  /// Whether polarity is meaningful (false for multi-bit signals).
+  bool isMultiBit = false;
+
+  /// Unique path index, assigned at collection time.
+  unsigned pathIndex = 0;
+};
+
 struct ForwardConstrainPass : public ::impl::ForwardConstrainBase<ForwardConstrainPass> {
   using ForwardConstrainBase::ForwardConstrainBase; // Inherit constructors
 
@@ -77,8 +123,41 @@ private:
   void traceIntoBlock(Block *block, TraceContext ctx,
                       SmallPtrSet<Block *, 8> &visitedBlocks);
   void resolveConstraintNames(const DenseMap<Value, int> &constraints, llvm::raw_string_ostream &os);
-  void reportPathSatisfiability(Operation *terminator, const TraceContext &ctx, llvm::StringSet<> &busWhitelist);
+  void reportPathSatisfiability(Operation *terminator, const TraceContext &ctx);
   void reportControlFlowInfluencedDrive(Operation *drvOp, const TraceContext &ctx);
+
+  /// Build a PathRecord from a TraceContext at a path endpoint and store it
+  /// in collectedPaths.  Returns a reference to the newly added record.
+  PathRecord &collectPath(Operation *endpoint, const TraceContext &ctx,
+                          bool controlFlowOnly);
+
+  /// After all paths are collected, print a structured summary that the user
+  /// can inspect to decide which signals are irrelevant bus signals.
+  void printCollectedPaths();
+
+  // --- Phase 3: Constant replacement ---
+
+  /// Main entry point for Phase 3.  Parses the replaceSignals option and
+  /// performs constant substitution for each specified bus signal.
+  void performReplacements();
+
+  /// Look up the replacement constant for `signalName` from the collected
+  /// path constraints.  Returns std::nullopt if the signal is not found or
+  /// has conflicting values across paths.
+  std::optional<int> determineReplacementValue(StringRef signalName);
+
+  /// Find all SSA Values corresponding to `signalName` in `module`
+  /// (port BlockArguments, llhd.sig+prb, struct_extract, wire).
+  SmallVector<Value, 4> findSignalValues(hw::HWModuleOp module,
+                                          StringRef signalName);
+
+  /// Replace a single signal in a module with the given constant value.
+  void replaceSignalInModule(hw::HWModuleOp module, StringRef signalName,
+                             int constValue);
+
+  /// Run MLIR built-in canonicalization patterns to fold constants and
+  /// eliminate dead code after replacement.
+  void runCanonicalization();
 
   // Helper for tracking visited nodes to prevent infinite loops in combinational cycles
   SmallPtrSet<Operation *, 16> globalVisited;
@@ -88,36 +167,35 @@ private:
   // propagation via hw.instance).
   DenseSet<Value> tracedRoots;
 
-  // Whitelist of bus signals for mutation
-  llvm::StringSet<> parsedBusSignalsWhitelist;
+  /// All paths collected during Phase 1 analysis.  Indexed by pathIndex.
+  /// This is the persistent data store that Phase 3 will consume.
+  SmallVector<PathRecord, 32> collectedPaths;
 };
 
 void ForwardConstrainPass::runOnOperation() {
   ModuleOp topModule = getOperation();
   StringRef targetName = targetSignal;
-  
+
   LLVM_DEBUG(llvm::dbgs() << "Starting ForwardConstrainPass targeting signal: "
                           << targetName << "\n");
 
-  parsedBusSignalsWhitelist.clear();
-  if (!busSignals.empty()) {
-    SmallVector<StringRef, 4> sigs;
-    StringRef(busSignals).split(sigs, ',', -1, false);
-    for (auto s : sigs) {
-      if (!s.trim().empty()) {
-        parsedBusSignalsWhitelist.insert(s.trim());
-      }
-    }
-  }
-
-  // Reset global visited set per generic run
+  // Reset all per-run state
   globalVisited.clear();
   tracedRoots.clear();
+  collectedPaths.clear();
 
-  // Find all HW modules
+  // Phase 1: trace all paths from the target signal and collect constraints
   for (auto hwModule : topModule.getOps<hw::HWModuleOp>()) {
     findTracingRoots(hwModule, targetName);
   }
+
+  // Print structured summary for user inspection (Phase 2 input)
+  printCollectedPaths();
+
+  // Phase 3: if the user enabled constant replacement via --fc-apply-constraints
+  // and specified bus signals via --fc-bus-signals, perform substitution.
+  if (applyConstraints)
+    performReplacements();
 }
 
 void ForwardConstrainPass::findTracingRoots(hw::HWModuleOp module, StringRef targetName) {
@@ -229,6 +307,10 @@ static bool isDefUseReachable(Value target, Value source,
 
 void ForwardConstrainPass::reportControlFlowInfluencedDrive(
     Operation *drvOp, const TraceContext &ctx) {
+  // Collect the path into persistent storage for Phase 3.
+  PathRecord &record = collectPath(drvOp, ctx, /*controlFlowOnly=*/true);
+
+  // Also print the legacy per-path output for backward compatibility.
   std::string constraintsStr;
   llvm::raw_string_ostream os(constraintsStr);
   resolveConstraintNames(ctx.constraints, os);
@@ -262,7 +344,7 @@ void ForwardConstrainPass::traceIntoBlock(
 
       if (valueFromRoot) {
         // Driven value directly depends on the traced signal: real causal write.
-        reportPathSatisfiability(drvOp, ctx, parsedBusSignalsWhitelist);
+        reportPathSatisfiability(drvOp, ctx);
       } else {
         // Driven value does NOT depend on the traced signal.
         // Determine whether the driven value is a zero/false constant:
@@ -281,17 +363,6 @@ void ForwardConstrainPass::traceIntoBlock(
           // Two-phase write-enable pattern: when the traced signal asserts a 1-bit
           // write-enable wire to constant-true, follow its probes into the
           // downstream register-update process.
-          // Example: gpio_sw_data_wen = 1'b1  →  (separate process)  →  gpio_sw_data = pwdata
-          //
-          // We require the driven value to be constant-true (all-ones).  This
-          // distinguishes genuine write-enable assertions from actual 1-bit data
-          // writes (e.g. gpio_int_level_sync driven by pwdata[0]) — those are NOT
-          // write-enables and following their probes would produce false positives.
-          //
-          // AXI4/AHB buses do NOT use this two-phase pattern: their write-enable
-          // conditions (wvalid AND wready, HWRITE AND HSEL) feed directly into
-          // the driven value via combinational logic, so isDefUseReachable catches
-          // them as direct data-flow paths without needing probe-following.
           auto inoutTy = dyn_cast<hw::InOutType>(drvOp.getSignal().getType());
           bool isConstTrue = false;
           if (auto constOp =
@@ -305,8 +376,6 @@ void ForwardConstrainPass::traceIntoBlock(
             }
           }
         }
-        // Zero-const drives (e.g. gpio_sw_data_wen=false in inactive branch)
-        // are silently suppressed — they are structural noise, not causal paths.
       }
 
     } else if (auto brOp = dyn_cast<cf::BranchOp>(&op)) {
@@ -324,9 +393,6 @@ void ForwardConstrainPass::traceIntoBlock(
         traceIntoBlock(innerCondBr.getFalseDest(), falseCtx, visitedBlocks);
       } else {
         // Nested branch whose condition is NOT derived from the traced signal
-        // (e.g. address decode: addr==X?).  Follow BOTH successors with the
-        // same context — the branch just selects between different registers,
-        // it does not change the sensitization conditions of the traced signal.
         traceIntoBlock(innerCondBr.getTrueDest(),  ctx, visitedBlocks);
         traceIntoBlock(innerCondBr.getFalseDest(), ctx, visitedBlocks);
       }
@@ -346,17 +412,13 @@ void ForwardConstrainPass::propagateConstraint(Value currentVal, TraceContext ct
     nextCtx.paths.push_back(user);
 
     if (auto extractOp = dyn_cast<hw::StructExtractOp>(user)) {
-      // If we are tracking a specific struct field (after a struct_create),
-      // only follow the struct_extract that extracts our field; skip others.
       if (ctx.trackedFieldName &&
           extractOp.getFieldNameAttr().getValue() != *ctx.trackedFieldName)
         continue;
       TraceContext extractCtx = nextCtx;
-      extractCtx.trackedFieldName = std::nullopt; // field has been unpacked
+      extractCtx.trackedFieldName = std::nullopt;
       propagateConstraint(extractOp.getResult(), extractCtx);
     } else if (auto structCreateOp = dyn_cast<hw::StructCreateOp>(user)) {
-      // The signal is being packed into a struct. Record which field it becomes
-      // so that downstream consumers can filter correctly.
       if (auto structType =
               dyn_cast<hw::StructType>(structCreateOp.getResult().getType())) {
         auto elements = structType.getElements();
@@ -377,9 +439,6 @@ void ForwardConstrainPass::propagateConstraint(Value currentVal, TraceContext ct
     } else if (auto sigExtractOp = dyn_cast<llhd::SigExtractOp>(user)) {
       propagateConstraint(sigExtractOp.getResult(), nextCtx);
     } else if (auto andOp = dyn_cast<comb::AndOp>(user)) {
-      // Sensitize AND gate: all other inputs must be all-ones to pass the signal.
-      // For i1 signals all-ones = 1; for wider signals use -1 (two's complement
-      // all-ones) so the display value matches the actual bit width.
       for (Value opnd : andOp.getOperands()) {
         if (opnd != currentVal) {
           auto intType = dyn_cast<IntegerType>(opnd.getType());
@@ -389,7 +448,6 @@ void ForwardConstrainPass::propagateConstraint(Value currentVal, TraceContext ct
       }
       propagateConstraint(andOp.getResult(), nextCtx);
     } else if (auto orOp = dyn_cast<comb::OrOp>(user)) {
-      // Sensitize OR gate: all other inputs must be 0 to pass the signal
       for (Value opnd : orOp.getOperands()) {
         if (opnd != currentVal) {
           nextCtx.constraints[opnd] = 0;
@@ -397,9 +455,6 @@ void ForwardConstrainPass::propagateConstraint(Value currentVal, TraceContext ct
       }
       propagateConstraint(orOp.getResult(), nextCtx);
     } else if (auto xorOp = dyn_cast<comb::XorOp>(user)) {
-      // XOR with all-ones is a NOT gate only for 1-bit signals.
-      // For multi-bit signals XOR with all-ones is bitwise inversion, which does
-      // not map to a simple polarity flip, so we skip the flip in that case.
       bool isOneBit = currentVal.getType().isInteger(1);
       bool hasConstAllOnes = false;
       for (Value opnd : xorOp.getOperands()) {
@@ -407,7 +462,6 @@ void ForwardConstrainPass::propagateConstraint(Value currentVal, TraceContext ct
           if (auto constOp = dyn_cast_or_null<hw::ConstantOp>(opnd.getDefiningOp())) {
             if (constOp.getValue().isAllOnes()) hasConstAllOnes = true;
           } else {
-            // Sensitize XOR gate without inversion: other input must be 0
             nextCtx.constraints[opnd] = 0;
           }
         }
@@ -417,9 +471,6 @@ void ForwardConstrainPass::propagateConstraint(Value currentVal, TraceContext ct
       propagateConstraint(xorOp.getResult(), nextCtx);
     } else if (auto muxOp = dyn_cast<comb::MuxOp>(user)) {
       if (currentVal == muxOp.getCond()) {
-        // The traced signal is the condition itself. We keep tracing the output.
-        // We might need to split paths here if we wanted both true and false paths,
-        // but typically a control signal will just drive logic forward.
         propagateConstraint(muxOp.getResult(), nextCtx);
       } else if (currentVal == muxOp.getTrueValue()) {
         nextCtx.constraints[muxOp.getCond()] = 1;
@@ -429,11 +480,6 @@ void ForwardConstrainPass::propagateConstraint(Value currentVal, TraceContext ct
         propagateConstraint(muxOp.getResult(), nextCtx);
       }
     } else if (auto icmpOp = dyn_cast<comb::ICmpOp>(user)) {
-      // For equality/inequality checks against constants.
-      // Always record the positive constraint "currentVal = constVal" so that
-      // multi-bit enum signals (e.g. a_opcode) carry their exact required value
-      // through the path, rather than only surfacing negative (_neq) constraints
-      // from downstream OR/AND gate sensitization.
       if (icmpOp.getPredicate() == comb::ICmpPredicate::eq ||
           icmpOp.getPredicate() == comb::ICmpPredicate::ceq ||
           icmpOp.getPredicate() == comb::ICmpPredicate::weq) {
@@ -441,11 +487,8 @@ void ForwardConstrainPass::propagateConstraint(Value currentVal, TraceContext ct
           if (opnd != currentVal) {
             if (auto constOp = dyn_cast_or_null<hw::ConstantOp>(opnd.getDefiningOp())) {
               int64_t constVal = constOp.getValue().getSExtValue();
-              // Polarity: icmp eq x, 0  acts as NOT for 1-bit signals.
-              // For multi-bit signals the polarity flip is kept for consistency.
               if (constOp.getValue().isZero())
                 nextCtx.expectedPolarity = 1 - nextCtx.expectedPolarity;
-              // Record the exact required value of the traced signal.
               nextCtx.constraints[currentVal] = constVal;
             }
           }
@@ -458,17 +501,12 @@ void ForwardConstrainPass::propagateConstraint(Value currentVal, TraceContext ct
             if (auto constOp = dyn_cast_or_null<hw::ConstantOp>(opnd.getDefiningOp())) {
               if (constOp.getValue().isAllOnes())
                 nextCtx.expectedPolarity = 1 - nextCtx.expectedPolarity;
-              // ne does not pin the signal to a single value, so no positive
-              // constraint is added here.
             }
           }
         }
       }
       propagateConstraint(icmpOp.getResult(), nextCtx);
     } else if (auto drvOp = dyn_cast<llhd::DrvOp>(user)) {
-      // Reached a drive endpoint.  Check whether the driven VALUE actually
-      // depends on the root signal (data-flow path) or merely whether the
-      // root controls WHEN this drive happens (control-flow path).
       Value drivenVal = drvOp.getValue();
       SmallPtrSet<Value, 16> reachVisited;
       bool valueFromRoot =
@@ -476,7 +514,7 @@ void ForwardConstrainPass::propagateConstraint(Value currentVal, TraceContext ct
           isDefUseReachable(drivenVal, nextCtx.rootValue, reachVisited);
 
       if (valueFromRoot) {
-        reportPathSatisfiability(drvOp, nextCtx, parsedBusSignalsWhitelist);
+        reportPathSatisfiability(drvOp, nextCtx);
         // Direct data-flow drive: always follow probes so the signal's value
         // can continue flowing through the rest of the design.
         Value sigVal = drvOp.getSignal();
@@ -487,8 +525,6 @@ void ForwardConstrainPass::propagateConstraint(Value currentVal, TraceContext ct
           }
         }
       } else {
-        // Driven value does not come from the traced signal (ctrl-flow path).
-        // Suppress zero-constant drives (register resets in inactive branches).
         bool isZeroConst = false;
         if (auto constOp =
                 dyn_cast_or_null<hw::ConstantOp>(drivenVal.getDefiningOp()))
@@ -498,7 +534,6 @@ void ForwardConstrainPass::propagateConstraint(Value currentVal, TraceContext ct
           reportControlFlowInfluencedDrive(drvOp, nextCtx);
           // Two-phase write-enable: only follow probes when the signal is a
           // 1-bit write-enable being driven with constant true.
-          // See the same guard in traceIntoBlock for the detailed rationale.
           auto inoutTy = dyn_cast<hw::InOutType>(drvOp.getSignal().getType());
           bool isConstTrue = false;
           if (auto constOp =
@@ -517,18 +552,12 @@ void ForwardConstrainPass::propagateConstraint(Value currentVal, TraceContext ct
       }
     } else if (auto condBrOp = dyn_cast<cf::CondBranchOp>(user)) {
       if (currentVal == condBrOp.getCondition()) {
-        // Case 1: traced value is the branch condition.
-        // Scan both successor blocks for downstream drives/branches.
-        // We do NOT report the branch itself as an endpoint here since
-        // traceIntoBlock will find the real endpoints in the successor blocks.
         SmallPtrSet<Block *, 8> visitedBlocks;
         TraceContext falseCtx = nextCtx;
         falseCtx.expectedPolarity = 1 - falseCtx.expectedPolarity;
         traceIntoBlock(condBrOp.getTrueDest(),  nextCtx,  visitedBlocks);
         traceIntoBlock(condBrOp.getFalseDest(), falseCtx, visitedBlocks);
       } else {
-        // Case 2: traced value is passed as a block argument.
-        // Follow the corresponding block argument in the successor.
         auto trueOps  = condBrOp.getTrueDestOperands();
         auto falseOps = condBrOp.getFalseDestOperands();
 
@@ -541,38 +570,24 @@ void ForwardConstrainPass::propagateConstraint(Value currentVal, TraceContext ct
             propagateConstraint(condBrOp.getFalseDest()->getArgument(i), nextCtx);
       }
     } else if (auto extractOp = dyn_cast<comb::ExtractOp>(user)) {
-      // Bit extraction: the traced signal (or some of its bits) flows into a
-      // narrower value. Update isMultiBit to reflect the result width so
-      // polarity output is correct for 1-bit extracts.
       TraceContext extractCtx = nextCtx;
       if (auto resultType = dyn_cast<IntegerType>(extractOp.getResult().getType()))
         extractCtx.isMultiBit = (resultType.getWidth() > 1);
       propagateConstraint(extractOp.getResult(), extractCtx);
     } else if (auto concatOp = dyn_cast<comb::ConcatOp>(user)) {
-      // Bit concatenation: the traced signal becomes part of a wider value.
-      // Mark as multi-bit because individual bit polarity is no longer
-      // meaningful for the concatenated result.
       TraceContext concatCtx = nextCtx;
       if (auto resultType = dyn_cast<IntegerType>(concatOp.getResult().getType()))
         concatCtx.isMultiBit = (resultType.getWidth() > 1);
       propagateConstraint(concatOp.getResult(), concatCtx);
     } else if (auto instOp = dyn_cast<hw::InstanceOp>(user)) {
-      // Cross-module propagation
       for (unsigned i = 0; i < instOp.getNumOperands(); ++i) {
         if (instOp.getOperand(i) == currentVal) {
           auto targetMod = dyn_cast_or_null<hw::HWModuleOp>(
               SymbolTable::lookupNearestSymbolFrom(instOp, instOp.getModuleNameAttr()));
           if (targetMod) {
             Value portVal = targetMod.getBodyBlock()->getArgument(i);
-            // Only trace into the inner module if it hasn't been traced yet.
-            // This prevents duplicate output when the same signal appears as
-            // a port in multiple modules (e.g. gpio_top → gpio_apbif → gpio0)
-            // and findTracingRoots would independently trace each one.
             if (!tracedRoots.insert(portVal).second)
               continue;
-            // Update rootValue to the inner module's port so that
-            // isDefUseReachable checks inside the inner module compare
-            // against the correct local BlockArgument (not the outer port).
             TraceContext innerCtx = nextCtx;
             innerCtx.rootValue = portVal;
             propagateConstraint(portVal, innerCtx);
@@ -621,7 +636,7 @@ static void resolveConstraintsBackward(Value val, int reqVal, SmallVectorImpl<st
       }
     }
   }
-  
+
   Operation *defOp = val.getDefiningOp();
   if (!defOp) {
     result.push_back({"anonymous", reqVal});
@@ -663,7 +678,6 @@ static void resolveConstraintsBackward(Value val, int reqVal, SmallVectorImpl<st
 
   // --- Recursive Combinational Logic Expansion ---
   if (auto andOp = dyn_cast<comb::AndOp>(defOp)) {
-    // To force an AND gate to 1, ALL inputs must be 1.
     if (reqVal == 1) {
       for (Value opnd : andOp.getOperands()) {
         resolveConstraintsBackward(opnd, 1, result);
@@ -672,7 +686,6 @@ static void resolveConstraintsBackward(Value val, int reqVal, SmallVectorImpl<st
     }
   }
   if (auto orOp = dyn_cast<comb::OrOp>(defOp)) {
-    // To force an OR gate to 0, ALL inputs must be 0.
     if (reqVal == 0) {
       for (Value opnd : orOp.getOperands()) {
         resolveConstraintsBackward(opnd, 0, result);
@@ -683,18 +696,16 @@ static void resolveConstraintsBackward(Value val, int reqVal, SmallVectorImpl<st
   if (auto icmpOp = dyn_cast<comb::ICmpOp>(defOp)) {
     Value lhs = icmpOp.getLhs();
     Value rhs = icmpOp.getRhs();
-    
-    // Look for a constant on either side
+
     auto lhsConst = dyn_cast_or_null<hw::ConstantOp>(lhs.getDefiningOp());
     auto rhsConst = dyn_cast_or_null<hw::ConstantOp>(rhs.getDefiningOp());
-    
+
     if (lhsConst || rhsConst) {
       Value varOpnd = lhsConst ? rhs : lhs;
       hw::ConstantOp constOp = lhsConst ? lhsConst : rhsConst;
-      
-      // Extract the integer value being compared against
+
       int targetVal = constOp.getValue().getSExtValue();
-      
+
       if (reqVal == 1) {
         switch (icmpOp.getPredicate()) {
           case comb::ICmpPredicate::eq:
@@ -705,22 +716,15 @@ static void resolveConstraintsBackward(Value val, int reqVal, SmallVectorImpl<st
           case comb::ICmpPredicate::ne:
           case comb::ICmpPredicate::cne:
           case comb::ICmpPredicate::wne:
-            // Could technically resolve `!=` as NOT targetVal
             break;
           default:
             break;
         }
       } else if (reqVal == 0) {
-        // If the eq condition must be false
         switch (icmpOp.getPredicate()) {
           case comb::ICmpPredicate::eq:
           case comb::ICmpPredicate::ceq:
           case comb::ICmpPredicate::weq: {
-            // It means varOpnd != targetVal.
-            // We can't easily express this in a simple int constraint map without changing the type.
-            // But we shouldn't emit "anonymous = 0".
-            // For now, let's just resolve the name of the variable so we at least know what's restricted.
-            // E.g "a_opcode_neq_0" = 1? Or just skip it. Let's just resolve its name and append "_neq"
             SmallVector<std::pair<std::string, int>, 1> dummy;
             resolveConstraintsBackward(varOpnd, targetVal, dummy);
             if (!dummy.empty()) {
@@ -736,7 +740,6 @@ static void resolveConstraintsBackward(Value val, int reqVal, SmallVectorImpl<st
     }
   }
   if (auto xorOp = dyn_cast<comb::XorOp>(defOp)) {
-    // Handle NOT gates (XOR with all ones)
     Value otherOpnd = nullptr;
     bool isNot = false;
     for (Value opnd : xorOp.getOperands()) {
@@ -749,17 +752,17 @@ static void resolveConstraintsBackward(Value val, int reqVal, SmallVectorImpl<st
       otherOpnd = opnd;
     }
     if (isNot && otherOpnd) {
-      resolveConstraintsBackward(otherOpnd, 1 - reqVal, result); // Invert requirement
+      resolveConstraintsBackward(otherOpnd, 1 - reqVal, result);
       return;
     }
   }
-  
+
   std::string parsedName = getSSAValueName(val);
   if (!parsedName.empty()) {
     result.push_back({parsedName, reqVal});
     return;
   }
-  
+
   LLVM_DEBUG(llvm::dbgs() << "Failed to resolve name for: " << val << "\n");
   result.push_back({"anonymous", reqVal});
 }
@@ -777,8 +780,7 @@ void ForwardConstrainPass::resolveConstraintNames(const DenseMap<Value, int> &co
     resolveConstraintsBackward(pair.first, pair.second, flattened);
   }
 
-  // Collect positive constraints (name → value) for redundancy elimination.
-  // e.g. "a_opcode = 1" makes "a_opcode_neq = 0" redundant.
+  // Collect positive constraints (name -> value) for redundancy elimination.
   llvm::StringMap<int> positiveConstraints;
   for (const auto &item : flattened) {
     if (item.first.find("_neq") == std::string::npos)
@@ -792,7 +794,6 @@ void ForwardConstrainPass::resolveConstraintNames(const DenseMap<Value, int> &co
     const std::string &name = item.first;
     int val = item.second;
 
-    // Drop "signal_neq = Y" when a positive "signal = X" already exists (X ≠ Y).
     if (name.size() > 4 && name.substr(name.size() - 4) == "_neq") {
       std::string baseName = name.substr(0, name.size() - 4);
       auto it = positiveConstraints.find(baseName);
@@ -809,64 +810,145 @@ void ForwardConstrainPass::resolveConstraintNames(const DenseMap<Value, int> &co
   }
 }
 
-/// Returns true if the port name looks like a clock or reset signal that must
-/// never be replaced by a constant during mutation.
-static bool isClockOrResetPortName(StringRef name) {
-  // Common naming conventions across APB, AXI, AHB, TL-UL, etc.
-  return name == "clk" || name == "clk_i" || name == "clock" ||
-         name == "rst" || name == "rst_n" || name == "rst_ni" ||
-         name == "reset" || name == "reset_n" || name == "aresetn" ||
-         name == "aclk" || name.starts_with("clk_") ||
-         name.starts_with("clock_") || name.ends_with("_clk") ||
-         name.ends_with("_clock") || name.ends_with("_rst") ||
-         name.ends_with("_rst_n") || name.ends_with("_reset");
+// ---------------------------------------------------------------------------
+// PathRecord collection: bridges Phase 1 analysis to Phase 3 replacement
+// ---------------------------------------------------------------------------
+
+PathRecord &ForwardConstrainPass::collectPath(
+    Operation *endpoint, const TraceContext &ctx, bool controlFlowOnly) {
+  PathRecord record;
+  record.pathIndex = collectedPaths.size();
+  record.endpoint = endpoint;
+  record.expectedPolarity = ctx.expectedPolarity;
+  record.isControlFlowOnly = controlFlowOnly;
+  record.isMultiBit = ctx.isMultiBit;
+  record.path = ctx.paths;
+
+  // Preserve the raw Value-level constraints for Phase 3 IR rewriting.
+  record.constraints = ctx.constraints;
+
+  // Resolve target register name.
+  if (auto drvOp = dyn_cast<llhd::DrvOp>(endpoint))
+    record.targetRegister = findNamedSignalBackward(drvOp.getSignal());
+  else if (auto condBrOp = dyn_cast<cf::CondBranchOp>(endpoint))
+    record.targetRegister =
+        "cf_branch@" +
+        condBrOp->getBlock()->getParentOp()->getName().getStringRef().str();
+  else
+    record.targetRegister = "unknown";
+
+  // Build the resolved (name, value) pairs once, so Phase 3 can match
+  // user-provided signal names by string comparison.
+  for (const auto &pair : ctx.constraints)
+    resolveConstraintsBackward(pair.first, pair.second,
+                               record.resolvedConstraints);
+
+  // Deduplicate resolved constraints (same logic as resolveConstraintNames).
+  {
+    llvm::StringMap<int> positiveConstraints;
+    for (const auto &item : record.resolvedConstraints)
+      if (item.first.find("_neq") == std::string::npos)
+        positiveConstraints[item.first] = item.second;
+
+    SmallVector<std::pair<std::string, int>, 8> deduped;
+    llvm::StringSet<> seen;
+    for (const auto &item : record.resolvedConstraints) {
+      const std::string &name = item.first;
+      int val = item.second;
+
+      if (name.size() > 4 && name.substr(name.size() - 4) == "_neq") {
+        std::string baseName = name.substr(0, name.size() - 4);
+        auto it = positiveConstraints.find(baseName);
+        if (it != positiveConstraints.end() && it->second != val)
+          continue;
+      }
+
+      std::string key = name + "=" + std::to_string(val);
+      if (seen.insert(key).second)
+        deduped.push_back({name, val});
+    }
+    record.resolvedConstraints = std::move(deduped);
+  }
+
+  collectedPaths.push_back(std::move(record));
+  return collectedPaths.back();
 }
 
-// Helper to check topological auto-detect rule mapping back to external inputs.
-// Returns false for clock/reset ports — mutating those would destroy the design.
-static bool isTopologicalBusSignal(Value val) {
-  if (auto arg = dyn_cast<BlockArgument>(val)) {
-    // Check the port name before allowing mutation
-    if (auto hwMod = dyn_cast<hw::HWModuleOp>(
-            arg.getParentRegion()->getParentOp())) {
-      if (arg.getArgNumber() < hwMod.getNumInputPorts()) {
-        StringRef portName =
-            hwMod.getInputNameAttr(arg.getArgNumber()).getValue();
-        if (isClockOrResetPortName(portName))
-          return false; // Never mutate clock/reset
+void ForwardConstrainPass::printCollectedPaths() {
+  if (collectedPaths.empty()) {
+    llvm::outs() << "No paths found for target signal.\n";
+    return;
+  }
+
+  llvm::outs() << "\n";
+  llvm::outs() << "====== Forward Constrain Analysis Results ======\n";
+  llvm::outs() << "Total paths collected: " << collectedPaths.size() << "\n";
+  llvm::outs() << "\n";
+
+  for (const auto &record : collectedPaths) {
+    llvm::outs() << "--- Path #" << record.pathIndex << " ---\n";
+
+    // Target and type
+    llvm::outs() << "  Target: " << record.targetRegister;
+    if (record.isControlFlowOnly)
+      llvm::outs() << " [ctrl-flow]";
+    llvm::outs() << "\n";
+
+    // Polarity (only meaningful for 1-bit signals)
+    if (!record.isMultiBit)
+      llvm::outs() << "  Polarity: " << record.expectedPolarity << "\n";
+
+    // Constraints
+    if (record.resolvedConstraints.empty()) {
+      llvm::outs() << "  Constraints: (none)\n";
+    } else {
+      llvm::outs() << "  Constraints:\n";
+      for (const auto &c : record.resolvedConstraints) {
+        llvm::outs() << "    " << c.first << " = " << c.second << "\n";
       }
     }
-    return true;
+
+    if (record.isControlFlowOnly)
+      llvm::outs() << "  Note: driven value does not depend on traced signal\n";
+
+    llvm::outs() << "\n";
   }
-  if (auto opResult = dyn_cast<OpResult>(val)) {
-    Operation *defOp = opResult.getDefiningOp();
-    if (auto ext = dyn_cast<hw::StructExtractOp>(defOp)) {
-      // Also guard struct fields named like clocks/resets
-      if (isClockOrResetPortName(ext.getFieldNameAttr().getValue()))
-        return false;
-      return isa<BlockArgument>(ext.getInput());
-    }
-    if (auto uExt = dyn_cast<hw::UnionExtractOp>(defOp)) {
-      if (isClockOrResetPortName(uExt.getFieldNameAttr().getValue()))
-        return false;
-      return isa<BlockArgument>(uExt.getInput());
-    }
-    if (auto sigExt = dyn_cast<llhd::SigExtractOp>(defOp)) {
-      return isa<BlockArgument>(sigExt.getInput());
-    }
-    if (auto prb = dyn_cast<llhd::PrbOp>(defOp)) {
-      if (dyn_cast_or_null<llhd::SignalOp>(prb.getSignal().getDefiningOp()))
-        return false; // Local signal, not a direct bus port
+
+  // Print signal summary: all unique signal names appearing across all paths
+  // with the set of values they take.  This is the view the user needs to
+  // decide which signals are irrelevant bus signals.
+  llvm::outs() << "====== Signal Constraint Summary ======\n";
+  llvm::StringMap<llvm::SmallSet<int, 4>> signalValues;
+  llvm::StringMap<unsigned> signalPathCount;
+  for (const auto &record : collectedPaths) {
+    for (const auto &c : record.resolvedConstraints) {
+      signalValues[c.first].insert(c.second);
+      signalPathCount[c.first]++;
     }
   }
-  return false;
+  for (const auto &entry : signalValues) {
+    llvm::outs() << "  " << entry.first() << ": appears in "
+                 << signalPathCount[entry.first()] << " path(s), values = {";
+    bool first = true;
+    for (int v : entry.second) {
+      if (!first) llvm::outs() << ", ";
+      llvm::outs() << v;
+      first = false;
+    }
+    llvm::outs() << "}\n";
+  }
+  llvm::outs() << "================================================\n\n";
 }
 
-void ForwardConstrainPass::reportPathSatisfiability(Operation *terminator, const TraceContext &ctx, llvm::StringSet<> &busWhitelist) {
+void ForwardConstrainPass::reportPathSatisfiability(Operation *terminator, const TraceContext &ctx) {
+  // Collect the path into persistent storage for Phase 3.
+  PathRecord &record = collectPath(terminator, ctx, /*controlFlowOnly=*/false);
+
+  // Also print the legacy per-path output for backward compatibility.
   std::string constraintsStr;
   llvm::raw_string_ostream os(constraintsStr);
   resolveConstraintNames(ctx.constraints, os);
-  
+
   std::string targetMsg;
   if (auto drvOp = dyn_cast<llhd::DrvOp>(terminator)) {
     targetMsg = "Hits register/wire drive: " + findNamedSignalBackward(drvOp.getSignal());
@@ -885,61 +967,201 @@ void ForwardConstrainPass::reportPathSatisfiability(Operation *terminator, const
   } else {
     llvm::outs() << "  No additional constraints required.\n";
   }
+}
 
-  if (applyConstraints) {
-    Builder builder(terminator->getContext());
-    for (const auto &pair : ctx.constraints) {
-      Value constraintVal = pair.first;
-      int reqValue = pair.second;
-      
-      std::string valName = getSSAValueName(constraintVal);
-      if (valName.empty()) {
-        SmallVector<std::pair<std::string, int>, 1> fallbackName;
-        resolveConstraintsBackward(constraintVal, reqValue, fallbackName);
-        if (!fallbackName.empty()) {
-          valName = fallbackName[0].first;
-        }
-      }
-      
-      bool allowedToMutate = false;
-      if (!busWhitelist.empty()) {
-        // Track 1: Whitelist Enforcement
-        if (busWhitelist.contains(valName)) {
-          allowedToMutate = true;
-        }
-      } else {
-        // Track 2: Topological Auto-Detection
-        if (isTopologicalBusSignal(constraintVal)) {
-          allowedToMutate = true;
-        }
-      }
+// ===========================================================================
+// Phase 3: Constant replacement engine
+// ===========================================================================
 
-      if (allowedToMutate) {
-        if (auto opResult = dyn_cast<OpResult>(constraintVal)) {
-          Operation *defOp = opResult.getDefiningOp();
-          OpBuilder ob(defOp);
-          // Insert constant AFTER the defining op so it's valid
-          ob.setInsertionPointAfter(defOp);
-          auto type = constraintVal.getType();
-          if (auto intType = dyn_cast<IntegerType>(type)) {
-            auto constOp = ob.create<hw::ConstantOp>(defOp->getLoc(), intType, reqValue);
-            constraintVal.replaceAllUsesWith(constOp.getResult());
-            llvm::outs() << "    [Mutation] Replaced '" << valName << "' w/ hw.constant " << reqValue << " (Width: " << intType.getWidth() << ")\n";
-          }
-        } else if (auto blkArg = dyn_cast<BlockArgument>(constraintVal)) {
-          Block *block = blkArg.getOwner();
-          OpBuilder ob(block, block->begin());
-          auto type = constraintVal.getType();
-          if (auto intType = dyn_cast<IntegerType>(type)) {
-            auto constOp = ob.create<hw::ConstantOp>(builder.getUnknownLoc(), intType, reqValue);
-            constraintVal.replaceAllUsesWith(constOp.getResult());
-            llvm::outs() << "    [Mutation] Replaced ViewPort '" << valName << "' w/ hw.constant " << reqValue << "\n";
-          }
-        }
-      } else if (!valName.empty()) {
-          llvm::outs() << "    [Mutation skipped] '" << valName << "' (Not in whitelist / not auto-detected as external bus)\n";
+void ForwardConstrainPass::performReplacements() {
+  if (busSignals.empty()) {
+    llvm::outs() << "\n--fc-apply-constraints is set but --fc-bus-signals is "
+                    "empty. Nothing to replace.\n";
+    return;
+  }
+
+  ModuleOp topModule = getOperation();
+
+  // Parse comma-separated signal names.
+  SmallVector<StringRef, 8> signalNames;
+  StringRef(busSignals).split(signalNames, ',', /*MaxSplit=*/-1,
+                               /*KeepEmpty=*/false);
+
+  llvm::outs() << "\n====== Phase 3: Constant Replacement ======\n";
+
+  bool anyReplaced = false;
+  for (StringRef sigName : signalNames) {
+    sigName = sigName.trim();
+    if (sigName.empty())
+      continue;
+
+    // Step 1: determine what constant this signal should be replaced with
+    //         (derived from Phase 1 collected constraints).
+    auto replValue = determineReplacementValue(sigName);
+    if (!replValue)
+      continue;
+
+    // Step 2: find and replace in every HW module.
+    for (auto hwModule : topModule.getOps<hw::HWModuleOp>()) {
+      replaceSignalInModule(hwModule, sigName, *replValue);
+    }
+    anyReplaced = true;
+  }
+
+  // Step 3: run canonicalization + DCE to fold constants and remove dead code.
+  if (anyReplaced) {
+    llvm::outs() << "\nRunning canonicalization and dead code elimination...\n";
+    runCanonicalization();
+    llvm::outs() << "Canonicalization complete.\n";
+  }
+
+  llvm::outs() << "================================================\n\n";
+}
+
+std::optional<int>
+ForwardConstrainPass::determineReplacementValue(StringRef signalName) {
+  llvm::SmallSet<int, 4> values;
+  unsigned pathCount = 0;
+
+  for (const auto &record : collectedPaths) {
+    for (const auto &c : record.resolvedConstraints) {
+      if (c.first == signalName.str()) {
+        values.insert(c.second);
+        pathCount++;
       }
     }
+  }
+
+  if (pathCount == 0) {
+    llvm::outs() << "Warning: signal '" << signalName
+                 << "' not found in any path constraints. Skipping.\n";
+    return std::nullopt;
+  }
+
+  if (values.size() > 1) {
+    llvm::outs() << "Warning: signal '" << signalName
+                 << "' requires different values across paths: {";
+    bool first = true;
+    for (int v : values) {
+      if (!first)
+        llvm::outs() << ", ";
+      llvm::outs() << v;
+      first = false;
+    }
+    llvm::outs() << "}. This signal may not be truly irrelevant. Skipping.\n";
+    return std::nullopt;
+  }
+
+  int constVal = *values.begin();
+  llvm::outs() << "Signal '" << signalName << "': uniform value " << constVal
+               << " across " << pathCount << " path(s).\n";
+  return constVal;
+}
+
+SmallVector<Value, 4>
+ForwardConstrainPass::findSignalValues(hw::HWModuleOp module,
+                                        StringRef signalName) {
+  SmallVector<Value, 4> results;
+
+  // 1. Module input ports (BlockArguments) — the most common case for bus
+  //    signals like psel, penable, etc.
+  for (unsigned i = 0, e = module.getNumInputPorts(); i < e; ++i) {
+    if (module.getInputNameAttr(i).getValue() == signalName) {
+      results.push_back(module.getBodyBlock()->getArgument(i));
+    }
+  }
+
+  // 2. Internal named signals and extractions.
+  module.walk([&](Operation *op) {
+    if (auto sigOp = dyn_cast<llhd::SignalOp>(op)) {
+      if (sigOp.getName() == signalName) {
+        // For llhd.sig the logic-side value is the result of llhd.prb.
+        for (Operation *user : sigOp.getResult().getUsers()) {
+          if (auto prbOp = dyn_cast<llhd::PrbOp>(user))
+            results.push_back(prbOp.getResult());
+        }
+      }
+    } else if (auto extractOp = dyn_cast<hw::StructExtractOp>(op)) {
+      if (extractOp.getFieldNameAttr().getValue() == signalName)
+        results.push_back(extractOp.getResult());
+    } else if (auto unionExtractOp = dyn_cast<hw::UnionExtractOp>(op)) {
+      if (unionExtractOp.getFieldNameAttr().getValue() == signalName)
+        results.push_back(unionExtractOp.getResult());
+    } else if (auto wireOp = dyn_cast<hw::WireOp>(op)) {
+      if (wireOp.getName() == signalName)
+        results.push_back(wireOp.getResult());
+    }
+  });
+
+  return results;
+}
+
+void ForwardConstrainPass::replaceSignalInModule(hw::HWModuleOp module,
+                                                  StringRef signalName,
+                                                  int constValue) {
+  SmallVector<Value, 4> signalValues = findSignalValues(module, signalName);
+  if (signalValues.empty())
+    return;
+
+  OpBuilder builder(module.getContext());
+
+  for (Value val : signalValues) {
+    // We can only replace integer-typed values with hw.constant.
+    // InOutType values (llhd signals) cannot be directly replaced — we
+    // replace their llhd.prb results instead (handled by findSignalValues).
+    auto intType = dyn_cast<IntegerType>(val.getType());
+    if (!intType) {
+      LLVM_DEBUG(llvm::dbgs()
+                 << "Skipping non-integer-typed signal: " << signalName
+                 << " (type: " << val.getType() << ")\n");
+      continue;
+    }
+
+    // Skip values with no uses to avoid creating dead constants.
+    if (val.use_empty())
+      continue;
+
+    // Create the replacement constant at the beginning of the module body
+    // so it dominates all uses.
+    builder.setInsertionPointToStart(module.getBodyBlock());
+    APInt constAPInt(intType.getWidth(),
+                     static_cast<uint64_t>(constValue),
+                     /*isSigned=*/constValue < 0);
+    auto constOp = builder.create<hw::ConstantOp>(module.getLoc(), constAPInt);
+
+    // Replace ALL uses of this signal value with the constant.
+    val.replaceAllUsesWith(constOp.getResult());
+
+    llvm::outs() << "  Replaced '" << signalName << "' (i"
+                 << intType.getWidth() << ") with constant " << constValue
+                 << " in module " << module.getName() << "\n";
+  }
+}
+
+void ForwardConstrainPass::runCanonicalization() {
+  MLIRContext *ctx = &getContext();
+  RewritePatternSet patterns(ctx);
+
+  // Collect canonicalization patterns from all loaded dialects.
+  // This covers comb, hw, llhd, cf, and any other dialect in the IR.
+  // After constant replacement, typical folds include:
+  //   comb.and(1, x) -> x
+  //   comb.or(0, x)  -> x
+  //   comb.icmp eq(const, const) -> const bool
+  //   cf.cond_br(true, ...) -> cf.br(...)
+  //   dead block elimination
+  for (auto *dialect : ctx->getLoadedDialects())
+    dialect->getCanonicalizationPatterns(patterns);
+
+  // Also collect patterns registered on individual operations.
+  for (RegisteredOperationName op : ctx->getRegisteredOperations())
+    op.getCanonicalizationPatterns(patterns, ctx);
+
+  GreedyRewriteConfig config;
+
+  if (failed(applyPatternsGreedily(getOperation(), std::move(patterns),
+                                    config))) {
+    llvm::outs() << "Warning: canonicalization did not converge.\n";
   }
 }
 

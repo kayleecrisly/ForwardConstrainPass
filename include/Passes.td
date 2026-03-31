@@ -148,38 +148,67 @@ def SignalFlowAnalysis : Pass<"signal-flow-analysis", "mlir::ModuleOp"> {
 //===----------------------------------------------------------------------===//
 
 def ForwardConstrain : Pass<"forward-constrain", "mlir::ModuleOp"> {
-  let summary = "Extract path sensitization constraints via forward tracing";
+  let summary = "Extract path sensitization constraints and simplify bus signals";
   let description = [{
-    Performs forward data-flow analysis starting from a specific target signal 
-    (e.g., 'pwrite') to extract the necessary constant combinations of other 
-    control signals (e.g., 'psel', 'penable') required to sensitize the path 
-    down to a side-effecting terminator (register driver or control flow branch).
+    Three-phase pass for bus signal simplification in the LLHD-to-QEMU pipeline.
 
-    Core features:
-    - Automatically traverses signal decodings (llhd.sig -> llhd.prb) and custom 
-      struct unpacking (hw.struct_extract) to maintain continuity.
-    - Transparently crosses hw.instance boundaries to trace paths into submodules.
-    - Uses a recursive constraint propagation engine covering Comb operations:
-      - AND: Constrains other inputs to 1
-      - OR: Constrains other inputs to 0
-      - XOR/NOT: Flips the expected tracking polarity
-      - MUX: Branches execution or constrains the select pin
-      - ICMP: Identifies required constant matching
-    - Resolves intermediate anonymized IR values back to named hardware signals.
+    == Phase 1: Constraint Collection (always runs) ==
 
-    Output:
-    - Detailed paths leading to side-effecting end points (llhd.drv, cf.cond_br).
-    - A human-readable list of required pin constraints (signal -> value) needed 
-      to make each path active.
+    Performs forward data-flow analysis starting from a target signal (e.g.,
+    'pwrite') to extract the necessary constant values of other control signals
+    (e.g., 'psel', 'penable') required to sensitize each path down to a
+    side-effecting endpoint (register driver or control flow branch).
+
+    Traversal covers:
+    - Signal decodings: llhd.sig -> llhd.prb
+    - Struct unpacking: hw.struct_extract / hw.struct_create
+    - Cross-module tracing: hw.instance port forwarding
+    - Combinational logic: AND (constrain to 1), OR (constrain to 0),
+      XOR/NOT (flip polarity), MUX (constrain select), ICMP (match constant)
+    - Control flow: cf.cond_br (split into true/false paths)
+
+    Output: per-path list of {target register, signal constraints} and a
+    signal summary showing which signals are uniform across all paths.
+
+    == Phase 2: User Decision (external) ==
+
+    The user inspects the Phase 1 output (Signal Constraint Summary) and
+    decides which signals are irrelevant bus signals. Only signal names are
+    needed — the pass already knows the required constant per path.
+
+    Signals that show a single uniform value across all paths (e.g.,
+    'psel: values = {1}') are prime candidates for replacement.
+
+    == Phase 3: Constant Replacement (runs when --fc-apply-constraints) ==
+
+    For each signal name in --fc-bus-signals:
+    1. Verify the signal has a uniform value across all collected paths.
+       If values differ across paths, warn and skip (the signal is likely
+       not truly irrelevant).
+    2. Locate the SSA Value(s) in each hw.module (port BlockArguments,
+       llhd.sig+prb, struct_extract, wire).
+    3. Replace all uses with hw.constant of the determined value.
+    4. Run MLIR built-in canonicalization + DCE to fold constants
+       (e.g., and(1,x)->x, icmp(c,c)->true, cond_br(true)->br)
+       and eliminate dead branches.
+
+    Usage:
+      # Phase 1 only: analyze and print constraints
+      --forward-constrain --target-signal="pwrite"
+
+      # Phase 1 + Phase 3: analyze, replace, and simplify
+      --forward-constrain --target-signal="pwrite" \
+        --fc-apply-constraints --fc-bus-signals="psel,pready"
   }];
 
   let options = [
     Option<"targetSignal", "target-signal", "std::string", /*default=*/"\"pwrite\"",
            "The originating control signal to trace forward">,
     Option<"applyConstraints", "fc-apply-constraints", "bool", /*default=*/"false",
-           "If true, mutate the IR by injecting hw.constant to replace identified bus signals">,
+           "If true, mutate the IR by replacing identified bus signals with constants">,
     Option<"busSignals", "fc-bus-signals", "std::string", /*default=*/"\"\"",
-           "Comma-separated list of signal names that are explicitly allowed to be replaced by constants">,
+           "Comma-separated list of irrelevant bus signal names to replace "
+           "with constants derived from Phase 1 analysis">,
   ];
 }
 
